@@ -8,7 +8,9 @@ import (
 
 // InitRouter 初始化并返回一个 Gin 引擎
 func InitRouter() *gin.Engine {
-	r := gin.Default()
+	r := gin.New()
+r.Use(gin.Recovery())
+r.Use(middleware.RequestLogger())
 
 	// 公共路由
 	r.POST("/register", handlers.Register)
