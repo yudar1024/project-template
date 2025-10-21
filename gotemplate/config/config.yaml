@@ -1,0 +1,12 @@
+server:
+  address: ":8080"
+
+database:
+  dsn: "user:password@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local"
+
+log:
+  level: "info"
+  path: "./logs/app.log"
+
+jwt:
+  secret: "your-secret-key"
