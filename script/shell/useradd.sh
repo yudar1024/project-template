@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 创建用户脚本：创建具有 sudo 权限和自定义 home 目录的用户，并设置默认密码
+# 创建用户脚本：创建具有 sudo 权限和自定义 home 目录的用户，并可靠设置默认密码
 
 # 检查是否以 root 身份运行
 if [[ $EUID -ne 0 ]]; then
@@ -22,7 +22,7 @@ fi
 
 USERNAME=$1
 HOME_DIR=$2
-# 设置你的默认明文密码
+# 设置你的默认明文密码（注意：#号在shell中有特殊含义，需要小心处理）
 DEFAULT_PLAIN_PASS="SG#1644"
 
 # 验证用户名有效性
@@ -47,26 +47,55 @@ if [ -d "$HOME_DIR" ]; then
     fi
 fi
 
-# --- 关键修改部分：生成加密密码并创建用户 ---
-echo "正在创建用户: $USERNAME，并设置默认密码"
-
-# 方法1：使用 openssl 生成加密密码 (推荐，更通用)
-ENCRYPTED_PASS=$(openssl passwd -6 "$DEFAULT_PLAIN_PASS" 2>/dev/null)
-
-# 如果 openssl 失败，尝试使用更古老的 crypt 函数（仅作后备，不建议）
-if [ -z "$ENCRYPTED_PASS" ]; then
-    echo "警告: openssl 生成密码失败，尝试使用 Perl 的 crypt 函数。"
-    ENCRYPTED_PASS=$(perl -e 'print crypt($ARGV[0], "salt")' "$DEFAULT_PLAIN_PASS")
-# fi
-
-# 使用 useradd 创建用户，并直接指定加密后的密码
-useradd -m -d "$HOME_DIR" -s /bin/bash -p "$ENCRYPTED_PASS" "$USERNAME"
+# 创建用户（先不设置密码）
+echo "正在创建用户: $USERNAME"
+useradd -m -d "$HOME_DIR" -s /bin/bash "$USERNAME"
 
 if [ $? -ne 0 ]; then
     echo "错误: 创建用户失败！"
     exit 1
 fi
-# --- 关键修改部分结束 ---
+
+# --- 关键修复部分：使用 chpasswd 可靠设置密码 ---
+echo "正在为用户设置默认密码..."
+
+# 方法1：使用 chpasswd（最可靠的方法，推荐）
+# 注意：这里使用管道传递密码，密码中的#不会被视为注释
+echo "$USERNAME:$DEFAULT_PLAIN_PASS" | chpasswd
+
+if [ $? -eq 0 ]; then
+    echo "✓ 密码设置成功（使用chpasswd）"
+else
+    echo "警告: chpasswd 设置密码失败，尝试备用方法..."
+    
+    # 方法2：使用 passwd --stdin（如果系统支持）
+    if echo "$DEFAULT_PLAIN_PASS" | passwd --stdin "$USERNAME" &>/dev/null; then
+        echo "✓ 密码设置成功（使用passwd --stdin）"
+    else
+        # 方法3：使用交互式expect（作为最后的手段）
+        echo "尝试使用expect设置密码..."
+        if command -v expect &>/dev/null; then
+            expect << EOF
+spawn passwd $USERNAME
+expect "new password:"
+send "$DEFAULT_PLAIN_PASS\r"
+expect "retype new password:"
+send "$DEFAULT_PLAIN_PASS\r"
+expect eof
+EOF
+            if [ $? -eq 0 ]; then
+                echo "✓ 密码设置成功（使用expect）"
+            else
+                echo "✗ 所有密码设置方法都失败了！"
+                echo "请手动运行: sudo passwd $USERNAME"
+            fi
+        else
+            echo "✗ expect命令未安装，请手动设置密码:"
+            echo "sudo passwd $USERNAME"
+        fi
+    fi
+fi
+# --- 关键修复部分结束 ---
 
 # 添加用户到 sudo 组
 echo "正在为用户添加 sudo 权限..."
@@ -81,11 +110,51 @@ fi
 chmod 700 "$HOME_DIR"
 chown -R "$USERNAME:$USERNAME" "$HOME_DIR"
 
-# 强制用户首次登录时修改密码（强烈建议的安全措施）
-# 取消下面一行的注释来启用此功能
-# passwd --expire "$USERNAME"
+# 检查SSH相关配置
+echo ""
+echo "检查SSH相关配置..."
+
+# 确保用户家目录下的.ssh目录权限正确（如果存在）
+USER_SSH_DIR="$HOME_DIR/.ssh"
+if [ -d "$USER_SSH_DIR" ]; then
+    chmod 700 "$USER_SSH_DIR"
+    chown -R "$USERNAME:$USERNAME" "$USER_SSH_DIR"
+    if [ -f "$USER_SSH_DIR/authorized_keys" ]; then
+        chmod 600 "$USER_SSH_DIR/authorized_keys"
+    fi
+    echo "✓ 已设置.ssh目录权限"
+fi
+
+# 检查PAM配置（影响密码登录）
+if [ -f /etc/ssh/sshd_config ]; then
+    PASSWORD_AUTH=$(grep -i "^PasswordAuthentication" /etc/ssh/sshd_config || echo "PasswordAuthentication yes")
+    echo "SSH密码认证设置: $PASSWORD_AUTH"
+    
+    # 如果配置中PasswordAuthentication是no，提醒用户
+    if echo "$PASSWORD_AUTH" | grep -qi "no"; then
+        echo "警告: SSH密码认证可能被禁用！"
+        echo "如需启用，请修改 /etc/ssh/sshd_config 并设置: PasswordAuthentication yes"
+        echo "然后重启SSH服务: sudo systemctl restart ssh"
+    fi
+fi
+
+# 检查用户账户状态
+echo ""
+echo "检查用户账户状态..."
+# 检查账户是否被锁定
+if passwd -S "$USERNAME" | grep -q "L"; then
+    echo "警告: 用户账户被锁定！正在解锁..."
+    usermod -U "$USERNAME"
+    echo "✓ 账户已解锁"
+fi
+
+# 强制用户首次登录时修改密码（安全建议）
+echo "正在设置密码过期策略..."
+passwd --expire "$USERNAME"
+echo "✓ 用户首次登录时必须更改密码"
 
 # 显示创建信息
+echo ""
 echo "==========================================="
 echo "用户创建成功！"
 echo "用户名: $USERNAME"
@@ -95,6 +164,13 @@ echo "Shell: $(getent passwd "$USERNAME" | cut -d: -f7)"
 echo "用户组: $(groups "$USERNAME")"
 echo "==========================================="
 echo ""
-echo "安全警告：用户首次登录后应立即修改此默认密码！"
-echo "测试登录: su - $USERNAME"
-echo "测试 sudo 权限: sudo -l -U $USERNAME"
+echo "重要提示:"
+echo "1. 用户首次登录时必须更改密码"
+echo "2. 测试SSH登录: ssh $USERNAME@$(hostname -I | awk '{print $1}')"
+echo "3. 测试本地登录: su - $USERNAME"
+echo "4. 测试 sudo 权限: sudo -l -U $USERNAME"
+echo ""
+echo "如果仍然无法SSH登录，请检查:"
+echo "1. /etc/ssh/sshd_config 中的 PasswordAuthentication 设置"
+echo "2. 用户账户状态: sudo passwd -S $USERNAME"
+echo "3. PAM配置: /etc/pam.d/sshd 和 /etc/pam.d/common-auth"
